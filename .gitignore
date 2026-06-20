@@ -1,0 +1,9 @@
+node_modules/
+dist/
+src/renderer/bundle.js
+*.log
+/AMMViewerContents
+AMMViewer.exe
+AMMViewer.lnk
+/private
+DESIGN.md

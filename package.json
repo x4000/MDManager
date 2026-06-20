@@ -1,0 +1,83 @@
+{
+  "name": "arcen-md-manager",
+  "version": "1.0.0",
+  "description": "AMM Viewer — Arcen MD Manager: a fast viewer (and future editor) for Markdown document trees",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "node build.js && electron .",
+    "dev": "node build.js && cross-env NODE_ENV=development electron .",
+    "watch": "node build.js --watch",
+    "build:win": "electron-builder --win portable",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux AppImage",
+    "build": "electron-builder --win --mac --linux",
+    "pack": "electron-builder --dir"
+  },
+  "build": {
+    "appId": "com.arcen.ammviewer",
+    "productName": "AMMViewer",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "icons/**/*",
+      "node_modules/**/*",
+      "package.json",
+      "!**/*.md",
+      "!**/*.markdown",
+      "!**/*.map",
+      "!**/*.ts",
+      "!**/*.d.ts",
+      "!**/{test,tests,__tests__,spec,example,examples,docs,doc}/**",
+      "!**/{LICENSE,LICENCE,license,COPYING,AUTHORS,CHANGELOG,HISTORY,NOTICE}*",
+      "!**/.github/**",
+      "!**/.vscode/**",
+      "!**/*.{yml,yaml}",
+      "!**/{.eslintrc,.prettierrc,.editorconfig,.babelrc,tsconfig.json,rollup.config.js}*"
+    ],
+    "extraResources": [],
+    "win": {
+      "target": "dir",
+      "icon": "icons/icon.png"
+    },
+    "mac": {
+      "target": "tar.gz",
+      "icon": "icons/icon.png",
+      "category": "public.app-category.productivity"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "icons/icon.png",
+      "executableName": "AMMViewer"
+    },
+    "portable": {
+      "artifactName": "AMMViewer.exe"
+    }
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.0.0",
+    "cross-env": "^7.0.3",
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.0",
+    "esbuild": "^0.24.0"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.10.3",
+    "@codemirror/lang-markdown": "^6.5.0",
+    "@codemirror/language": "^6.12.3",
+    "@codemirror/search": "^6.7.1",
+    "@codemirror/state": "^6.6.0",
+    "@codemirror/view": "^6.43.1",
+    "@lezer/highlight": "^1.2.3",
+    "chokidar": "^4.0.0",
+    "dompurify": "^3.4.11",
+    "highlight.js": "^11.11.1",
+    "markdown-it": "^14.2.0",
+    "markdown-it-anchor": "^9.2.0",
+    "markdown-it-task-lists": "^2.1.1",
+    "mermaid": "^11.15.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}
