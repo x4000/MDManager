@@ -57,6 +57,8 @@ contextBridge.exposeInMainWorld('arcenApi', {
   renamePath: (absOld, newName, isFile) => ipcRenderer.invoke('rename-path', absOld, newName, isFile),
   deletePath: (absPath) => ipcRenderer.invoke('delete-path', absPath),
   movePath: (absSrc, absDestDir) => ipcRenderer.invoke('move-path', absSrc, absDestDir),
+  // Convert a Markdown file to a .docx written next to it.
+  convertToDocx: (absPath) => ipcRenderer.invoke('convert-to-docx', absPath),
 
   // Cross-window relays
   sendTheme: (theme) => ipcRenderer.send('theme-change', theme),

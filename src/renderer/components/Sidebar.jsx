@@ -13,32 +13,57 @@ function folderIcon(theme) {
   return theme === 'dark' ? '../../icons/folder-yellow.png' : '../../icons/folder-purple.png';
 }
 
+const isDocxName = (name) => /\.docx$/i.test(name || '');
+
+// Hide .docx files (and folders that hold only docx) when the toggle is off,
+// while still keeping app-created empty folders — which arrive from the tree
+// walk as folders with no files and no subfolders.
+function filterDocx(node, showDocx) {
+  const files = showDocx ? node.files : node.files.filter((f) => !isDocxName(f.name));
+  const dirs = [];
+  for (const d of node.dirs) {
+    const wasEmpty = !d.dirs.length && !d.files.length; // a kept empty folder
+    const sub = filterDocx(d, showDocx);
+    if (wasEmpty || sub.dirs.length || sub.files.length) {
+      dirs.push({ name: d.name, relPath: d.relPath, dirs: sub.dirs, files: sub.files });
+    }
+  }
+  return { dirs, files };
+}
+
 // When a folder name matches the search, keep its whole subtree; otherwise keep
-// only matching descendants.
-function filterTree(node, s, matchFiles, matchFolders) {
+// only matching descendants. Docx files are excluded unless the toggle is on.
+function filterTree(node, s, matchFiles, matchFolders, showDocx) {
+  const visible = (f) => showDocx || !isDocxName(f.name);
   const dirs = [];
   for (const d of node.dirs) {
     const nameHit = matchFolders && d.name.toLowerCase().includes(s);
     if (nameHit) {
-      dirs.push({ name: d.name, relPath: d.relPath, dirs: d.dirs, files: d.files });
+      const kept = filterDocx({ dirs: d.dirs, files: d.files }, showDocx);
+      dirs.push({ name: d.name, relPath: d.relPath, dirs: kept.dirs, files: kept.files });
       continue;
     }
-    const sub = filterTree(d, s, matchFiles, matchFolders);
+    const sub = filterTree(d, s, matchFiles, matchFolders, showDocx);
     if (sub.dirs.length || sub.files.length) {
       dirs.push({ name: d.name, relPath: d.relPath, dirs: sub.dirs, files: sub.files });
     }
   }
   const files = [];
   for (const f of node.files) {
-    if (matchFiles && f.name.toLowerCase().includes(s)) files.push(f);
+    if (matchFiles && visible(f) && f.name.toLowerCase().includes(s)) files.push(f);
   }
   return { dirs, files };
 }
 
-function buildRows({ roots, trees, expandedRoots, expandedFolders, search, matchFiles, matchFolders }) {
+function buildRows({ roots, trees, expandedRoots, expandedFolders, search, matchFiles, matchFolders, showDocx }) {
   const rows = [];
   const s = (search || '').trim().toLowerCase();
   const searching = !!s;
+
+  const fileRow = (f, rootPath, depth) => {
+    const docKey = `${rootPath}|${f.relPath}`;
+    rows.push({ kind: 'file', key: `f:${docKey}`, rootPath, relPath: f.relPath, name: f.name, depth, docKey, isDocx: isDocxName(f.name) });
+  };
 
   // Force-expanded emit (used when searching).
   const emitOpen = (node, rootPath, depth) => {
@@ -47,10 +72,7 @@ function buildRows({ roots, trees, expandedRoots, expandedFolders, search, match
       rows.push({ kind: 'folder', key: `d:${folderKey}`, rootPath, name: d.name, depth, expanded: true, folderKey });
       emitOpen(d, rootPath, depth + 1);
     }
-    for (const f of node.files) {
-      const docKey = `${rootPath}|${f.relPath}`;
-      rows.push({ kind: 'file', key: `f:${docKey}`, rootPath, relPath: f.relPath, name: f.name, depth, docKey });
-    }
+    for (const f of node.files) fileRow(f, rootPath, depth);
   };
 
   const emit = (node, rootPath, depth) => {
@@ -60,10 +82,7 @@ function buildRows({ roots, trees, expandedRoots, expandedFolders, search, match
       rows.push({ kind: 'folder', key: `d:${folderKey}`, rootPath, name: d.name, depth, expanded, folderKey });
       if (expanded) emit(d, rootPath, depth + 1);
     }
-    for (const f of node.files) {
-      const docKey = `${rootPath}|${f.relPath}`;
-      rows.push({ kind: 'file', key: `f:${docKey}`, rootPath, relPath: f.relPath, name: f.name, depth, docKey });
-    }
+    for (const f of node.files) fileRow(f, rootPath, depth);
   };
 
   for (const root of roots) {
@@ -72,7 +91,7 @@ function buildRows({ roots, trees, expandedRoots, expandedFolders, search, match
       rows.push({ kind: 'root', key: `r:${root.path}`, rootPath: root.path, nickname: root.nickname || root.path, expanded: true, depth: 0 });
       if (!ts || ts.loading) { rows.push({ kind: 'status', key: `s:${root.path}`, text: 'Loading…', depth: 1 }); continue; }
       if (ts.error) { rows.push({ kind: 'status', key: `s:${root.path}`, text: '(could not read folder)', depth: 1 }); continue; }
-      const filtered = filterTree(ts.tree, s, matchFiles, matchFolders);
+      const filtered = filterTree(ts.tree, s, matchFiles, matchFolders, showDocx);
       if (!filtered.dirs.length && !filtered.files.length) { rows.push({ kind: 'status', key: `s:${root.path}`, text: '(no matches)', depth: 1 }); continue; }
       emitOpen(filtered, root.path, 1);
     } else {
@@ -82,8 +101,9 @@ function buildRows({ roots, trees, expandedRoots, expandedFolders, search, match
       if (!ts || ts.loading) rows.push({ kind: 'status', key: `s:${root.path}`, text: 'Loading…', depth: 1 });
       else if (ts.error) rows.push({ kind: 'status', key: `s:${root.path}`, text: ts.error === 'not-found' ? '(folder not found)' : '(could not read folder)', depth: 1 });
       else if (ts.tree) {
-        if (!ts.tree.dirs.length && !ts.tree.files.length) rows.push({ kind: 'status', key: `s:${root.path}`, text: '(no .md files)', depth: 1 });
-        else emit(ts.tree, root.path, 1);
+        const tree = filterDocx(ts.tree, showDocx);
+        if (!tree.dirs.length && !tree.files.length) rows.push({ kind: 'status', key: `s:${root.path}`, text: '(no documents)', depth: 1 });
+        else emit(tree, root.path, 1);
       }
     }
   }
@@ -96,6 +116,9 @@ export default function Sidebar({
   roots,
   theme,
   trees,
+  showDocx,
+  onToggleDocx,
+  onTreeRefresh,
   expandedRoots,
   expandedFolders,
   activeKey,
@@ -138,7 +161,7 @@ export default function Sidebar({
     if (val.trim() && onEnsureTrees) onEnsureTrees();
   };
 
-  const rows = buildRows({ roots, trees, expandedRoots, expandedFolders, search, matchFiles, matchFolders });
+  const rows = buildRows({ roots, trees, expandedRoots, expandedFolders, search, matchFiles, matchFolders, showDocx });
   const rowsRef = useRef(rows);
   rowsRef.current = rows;
 
@@ -176,10 +199,20 @@ export default function Sidebar({
       else if (r && r.error) window.alert(r.error);
     },
   });
-  const newFolderIn = (absDir) => setPrompt({
+  const newFolderIn = (rootPath, absDir) => setPrompt({
     title: 'New folder', initial: '',
-    onSubmit: async (name) => { const r = await window.arcenApi.createFolder(absDir, name); if (r && r.error) window.alert(r.error); },
+    onSubmit: async (name) => {
+      const r = await window.arcenApi.createFolder(absDir, name);
+      if (r && r.ok) { if (onTreeRefresh) onTreeRefresh(rootPath); }
+      else if (r && r.error) window.alert(r.error);
+    },
   });
+  // Convert a Markdown file to a .docx next to it, then refresh so it appears.
+  const convertToDocx = async (rootPath, abs) => {
+    const r = await window.arcenApi.convertToDocx(abs);
+    if (r && r.ok) { if (onTreeRefresh) onTreeRefresh(rootPath); }
+    else if (r && r.error) window.alert(r.error);
+  };
   const renamePathRow = (rootPath, rel, abs, isFile) => setPrompt({
     title: isFile ? 'Rename file' : 'Rename folder', initial: abs.split('/').pop(),
     onSubmit: async (name) => {
@@ -216,8 +249,10 @@ export default function Sidebar({
       items: [
         ...favoriteMenuItems(file, favorites, onFavoritesChange),
         { divider: true },
+        { label: 'Convert to Word (.docx)', action: () => convertToDocx(row.rootPath, abs) },
+        { divider: true },
         { label: 'New file…', action: () => newFileIn(row.rootPath, dirAbs, parentRel) },
-        { label: 'New folder…', action: () => newFolderIn(dirAbs) },
+        { label: 'New folder…', action: () => newFolderIn(row.rootPath, dirAbs) },
         { label: 'Rename…', action: () => renamePathRow(row.rootPath, row.relPath, abs, true) },
         { label: 'Delete…', action: () => deletePathRow(row.rootPath, row.relPath, abs) },
         { divider: true },
@@ -240,6 +275,35 @@ export default function Sidebar({
     else show();
   };
 
+  const absForFileRow = (row) => row.rootPath.replace(/[\\/]+$/, '') + '/' + row.relPath;
+
+  // Docx files aren't opened in-app, so their menu is OS-oriented: open in Word,
+  // plus rename/delete/reveal. No favorites / convert.
+  const buildDocxMenu = (row, abs, x, y, sx, sy) => {
+    const ws = winShellItem(abs, sx, sy);
+    setMenu({
+      x, y,
+      items: [
+        { label: 'Open in Word', action: () => window.arcenApi.openPath(abs) },
+        { divider: true },
+        { label: 'Rename…', action: () => renamePathRow(row.rootPath, row.relPath, abs, true) },
+        { label: 'Delete…', action: () => deletePathRow(row.rootPath, row.relPath, abs) },
+        { divider: true },
+        { label: 'Reveal in Explorer', action: () => window.arcenApi.showInFolder(abs) },
+        { label: 'Copy path', action: () => { try { navigator.clipboard.writeText(abs); } catch (_) { /* ignore */ } } },
+        ...(ws ? [{ divider: true }, ws] : []),
+      ],
+    });
+  };
+  const openDocxMenu = (e, row) => {
+    e.preventDefault();
+    const abs = absForFileRow(row);
+    const { clientX, clientY, screenX, screenY } = e;
+    const show = () => buildDocxMenu(row, abs, clientX, clientY, screenX, screenY);
+    if (e.ctrlKey && window.arcenApi.platform === 'win32') tryNativeMenu(abs, screenX, screenY, show);
+    else show();
+  };
+
   const absForFolderRow = (row) => {
     const base = row.rootPath.replace(/[\\/]+$/, '');
     if (row.kind === 'root') return base;
@@ -253,7 +317,7 @@ export default function Sidebar({
       x, y,
       items: [
         { label: 'New file…', action: () => newFileIn(row.rootPath, abs, rel) },
-        { label: 'New folder…', action: () => newFolderIn(abs) },
+        { label: 'New folder…', action: () => newFolderIn(row.rootPath, abs) },
         ...(row.kind !== 'root' ? [
           { label: 'Rename…', action: () => renamePathRow(row.rootPath, rel, abs, false) },
           { label: 'Delete…', action: () => deletePathRow(row.rootPath, rel, abs) },
@@ -345,7 +409,9 @@ export default function Sidebar({
         if (!moved) return;
         const dest = dropDirAt(clientX, clientY, srcAbs);
         if (dest) moveFileTo(row, dest);
-        else if (!inside) window.arcenApi.detachTabAtPosition({ rootPath: row.rootPath, relPath: row.relPath, name: row.name }, screenX, screenY);
+        // Dragging a docx outside the window does nothing — only AMM (.md) docs
+        // tear off into a new window.
+        else if (!inside && !row.isDocx) window.arcenApi.detachTabAtPosition({ rootPath: row.rootPath, relPath: row.relPath, name: row.name }, screenX, screenY);
       },
     });
   };
@@ -433,6 +499,24 @@ export default function Sidebar({
     }
 
     if (row.kind === 'file') {
+      if (row.isDocx) {
+        // Word docs: not opened in-app (no single-click open, no active state),
+        // double-click opens in the OS, and they can still be dragged to move.
+        return (
+          <div
+            className="tree-row docx"
+            style={{ paddingLeft: indent }}
+            onMouseDown={(e) => onFileMouseDown(e, row)}
+            onDoubleClick={() => window.arcenApi.openPath(absForFileRow(row))}
+            onContextMenu={(e) => openDocxMenu(e, row)}
+            title={row.relPath + '  —  double-click to open in Word'}
+          >
+            <span className="spacer" />
+            <img src="../../icons/doc-file.png" alt="" />
+            <span className="label">{row.name}</span>
+          </div>
+        );
+      }
       return (
         <div
           className={'tree-row' + (activeKey === row.docKey ? ' active' : '')}
@@ -476,6 +560,11 @@ export default function Sidebar({
         <>
           <div className="sidebar-header">
             <span>Folders</span>
+            <button
+              className={'docx-toggle' + (showDocx ? ' active' : '')}
+              title={showDocx ? 'Hide Word (.docx) files' : 'Show Word (.docx) files'}
+              onClick={onToggleDocx}
+            >docx</button>
             <button className="icon-btn" title="Add a folder of Markdown documents" onClick={onAddRoot}>＋</button>
           </div>
           <div className="sidebar-search">

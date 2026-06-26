@@ -257,6 +257,28 @@ html, body, #root {
 }
 .icon-btn:hover { opacity: 1; background: rgba(255,255,255,0.15); }
 
+/* Show/hide-docx toggle in the Folders header. */
+.docx-toggle {
+  background: transparent;
+  border: 1px solid currentColor;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.55;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 5px;
+  margin-left: auto;
+  margin-right: 4px;
+  border-radius: 3px;
+  text-transform: lowercase;
+}
+.docx-toggle:hover { opacity: 0.9; }
+.docx-toggle.active { opacity: 1; background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* Word (.docx) rows: muted (their own doc icon); not opened in-app. */
+.tree-row.docx .label { color: var(--text-dim); }
+.tree-row.docx img { opacity: 0.55; }
+
 .root-header {
   display: flex;
   align-items: center;

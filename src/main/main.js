@@ -9,6 +9,7 @@ const { app, BrowserWindow, ipcMain, dialog, shell, screen } = require('electron
 const fs = require('fs');
 const path = require('path');
 const chokidar = require('chokidar');
+const { convertMarkdownToDocx } = require('./mdToDocx');
 
 // ── Central settings location ────────────────────────────────────────
 // Mirrors AXE's `%APPDATA%/ArcenSettings/<App>/` convention so all Arcen
@@ -51,6 +52,12 @@ const DEFAULT_SETTINGS = {
   theme: 'light',
   sidebarSide: 'left',
   sidebarWidth: 260,
+  // Show Word (.docx) files alongside Markdown in the sidebar.
+  showDocx: false,
+  // Folders created through the app, kept visible in the tree even while empty
+  // (so you can make a folder and then drag things into it). Keys are
+  // `rootPath + '|' + relPath` (forward-slashed relPath).
+  keptFolders: [],
 };
 
 // Rename an unparseable file aside instead of letting it be silently
@@ -132,7 +139,15 @@ function isIgnoredDirName(name) {
   return IGNORE_DIRS.has(name) || name.toLowerCase().endsWith('.app');
 }
 
-function buildTree(absRoot) {
+// A file we surface in the tree: Markdown always, Word docs so the renderer can
+// optionally show/hide them.
+function isTreeFile(name) {
+  const n = name.toLowerCase();
+  return n.endsWith('.md') || n.endsWith('.docx');
+}
+
+function buildTree(absRoot, keptSet) {
+  const kept = keptSet || new Set();
   const collator = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
   // Canonical paths already descended into, so an NTFS junction / symlink that
   // points back at an ancestor can't drive unbounded recursion.
@@ -153,10 +168,12 @@ function buildTree(absRoot) {
       if (e.isDirectory()) {
         if (isIgnoredDirName(e.name)) continue;
         const child = walk(path.join(absDir, e.name), rel);
-        if (child.dirs.length || child.files.length) {
+        // Keep a folder if it holds documents/subfolders, OR if it was created
+        // through the app (kept) so a freshly-made empty folder still shows.
+        if (child.dirs.length || child.files.length || kept.has(rel.toLowerCase())) {
           dirs.push({ name: e.name, relPath: rel, dirs: child.dirs, files: child.files });
         }
-      } else if (e.isFile() && e.name.toLowerCase().endsWith('.md')) {
+      } else if (e.isFile() && isTreeFile(e.name)) {
         files.push({ name: e.name, relPath: rel });
       }
     }
@@ -165,6 +182,60 @@ function buildTree(absRoot) {
     return { dirs, files };
   }
   return walk(absRoot, '');
+}
+
+// ── Kept (app-created) folders ───────────────────────────────────────
+// A folder made through the app is remembered so the tree shows it even while
+// empty; otherwise the empty-folder prune would hide it the instant it's made.
+const keptKey = (rootPath, relPath) => `${rootPath}|${(relPath || '').replace(/\\/g, '/')}`;
+function getKeptFolders() {
+  const k = loadSettings().keptFolders;
+  return Array.isArray(k) ? k : [];
+}
+function setKeptFolders(list) {
+  saveSettings({ keptFolders: Array.from(new Set(list)) });
+}
+function addKeptFolder(rootPath, relPath) {
+  if (!rootPath || !relPath) return;
+  const key = keptKey(rootPath, relPath);
+  const list = getKeptFolders();
+  if (!list.includes(key)) setKeptFolders(list.concat(key));
+}
+function removeKeptUnder(rootPath, relPath) {
+  const base = keptKey(rootPath, relPath);
+  const list = getKeptFolders();
+  const next = list.filter((k) => k !== base && !k.startsWith(base + '/'));
+  if (next.length !== list.length) setKeptFolders(next);
+}
+function remapKept(oldRoot, oldRel, newRoot, newRel) {
+  const oldBase = keptKey(oldRoot, oldRel);
+  const newBase = keptKey(newRoot, newRel);
+  const list = getKeptFolders();
+  let changed = false;
+  const next = list.map((k) => {
+    if (k === oldBase) { changed = true; return newBase; }
+    if (k.startsWith(oldBase + '/')) { changed = true; return newBase + k.slice(oldBase.length); }
+    return k;
+  });
+  if (changed) setKeptFolders(next);
+}
+// The remembered relPaths (lowercased) for one root, for buildTree's prune.
+function keptSetForRoot(rootPath) {
+  const prefix = `${rootPath}|`;
+  const set = new Set();
+  for (const k of getKeptFolders()) if (k.startsWith(prefix)) set.add(k.slice(prefix.length).toLowerCase());
+  return set;
+}
+// Drop remembered folders that no longer exist on disk (self-healing hygiene).
+function pruneKeptFolders(rootPath) {
+  const prefix = `${rootPath}|`;
+  const list = getKeptFolders();
+  const next = list.filter((k) => {
+    if (!k.startsWith(prefix)) return true;
+    const rel = k.slice(prefix.length);
+    try { return fs.existsSync(path.join(rootPath, rel)); } catch (_) { return false; }
+  });
+  if (next.length !== list.length) setKeptFolders(next);
 }
 
 function buildSearchRegex(query, opts) {
@@ -278,8 +349,15 @@ function setupWatcher() {
   // as add rather than change, so an open doc must reload on both. noteChange
   // additionally refreshes the sidebar tree on add/unlink.
   watcher.on('change', reloadOpenDoc);
-  watcher.on('add', (p) => { if (p.toLowerCase().endsWith('.md')) { noteChange(p); reloadOpenDoc(p); } });
-  watcher.on('unlink', (p) => { if (p.toLowerCase().endsWith('.md')) noteChange(p); });
+  watcher.on('add', (p) => {
+    const lp = p.toLowerCase();
+    if (lp.endsWith('.md')) { noteChange(p); reloadOpenDoc(p); }
+    else if (lp.endsWith('.docx')) noteChange(p);
+  });
+  watcher.on('unlink', (p) => {
+    const lp = p.toLowerCase();
+    if (lp.endsWith('.md') || lp.endsWith('.docx')) noteChange(p);
+  });
   watcher.on('addDir', noteChange);
   watcher.on('unlinkDir', noteChange);
   // A broad root (e.g. a whole repo dir) can surface EPERM/ENOENT on odd files
@@ -692,7 +770,8 @@ ipcMain.handle('set-root-nickname', (_e, rootPath, nickname) => {
 ipcMain.handle('list-tree', (_e, rootPath) => {
   try {
     if (!rootPath || !fs.existsSync(rootPath)) return { ok: false, error: 'not-found' };
-    return { ok: true, tree: buildTree(rootPath) };
+    pruneKeptFolders(rootPath);
+    return { ok: true, tree: buildTree(rootPath, keptSetForRoot(rootPath)) };
   } catch (err) {
     return { ok: false, error: err.message };
   }
@@ -986,7 +1065,33 @@ ipcMain.handle('create-folder', (_e, absDir, name) => {
     const target = path.join(absDir, safe);
     if (fs.existsSync(target)) return { ok: false, error: 'A folder with that name already exists' };
     fs.mkdirSync(target);
-    return { ok: true, path: target, name: safe };
+    // Remember it so the tree keeps showing it while it's still empty.
+    const loc = locateInRoots(target);
+    if (loc.rootPath) addKeptFolder(loc.rootPath, loc.relPath);
+    return { ok: true, path: target, name: safe, rootPath: loc.rootPath, relPath: loc.relPath };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+// Convert a Markdown file to a .docx written next to it. Re-conversion asks
+// before overwriting an existing .docx so a hand-edited one isn't clobbered.
+ipcMain.handle('convert-to-docx', async (e, absPath) => {
+  try {
+    if (!isUnderRoot(absPath)) return { ok: false, error: 'Outside a configured folder' };
+    if (!/\.md$/i.test(absPath)) return { ok: false, error: 'Not a Markdown file' };
+    if (!fs.existsSync(absPath)) return { ok: false, error: 'File not found' };
+    const target = absPath.replace(/\.md$/i, '.docx');
+    if (fs.existsSync(target)) {
+      const win = BrowserWindow.fromWebContents(e.sender);
+      const { response } = await dialog.showMessageBox(win, {
+        type: 'question', buttons: ['Overwrite', 'Cancel'], defaultId: 1, cancelId: 1, noLink: true,
+        title: 'Convert to Word', message: `"${path.basename(target)}" already exists. Overwrite it?`,
+      });
+      if (response !== 0) return { ok: false, canceled: true };
+    }
+    const markdown = fs.readFileSync(absPath, 'utf-8');
+    fs.writeFileSync(target, convertMarkdownToDocx(markdown));
+    const loc = locateInRoots(target);
+    return { ok: true, path: target, rootPath: loc.rootPath, relPath: loc.relPath };
   } catch (err) { return { ok: false, error: err.message }; }
 });
 
@@ -1001,6 +1106,11 @@ ipcMain.handle('rename-path', (_e, absOld, newName, isFile) => {
     if (target === absOld) return { ok: true, path: target, name: fname };
     if (fs.existsSync(target) && target.toLowerCase() !== absOld.toLowerCase()) return { ok: false, error: 'A file or folder with that name already exists' };
     fs.renameSync(absOld, target);
+    if (!isFile) {
+      const a = locateInRoots(absOld);
+      const b = locateInRoots(target);
+      if (a.rootPath && b.rootPath) remapKept(a.rootPath, a.relPath, b.rootPath, b.relPath);
+    }
     return { ok: true, path: target, name: fname };
   } catch (err) { return { ok: false, error: err.message }; }
 });
@@ -1040,6 +1150,8 @@ ipcMain.handle('move-path', (_e, absSrc, absDestDir) => {
       } else { throw err; }
     }
     const loc = locateInRoots(target);
+    const src = locateInRoots(absSrc);
+    if (src.rootPath && loc.rootPath) remapKept(src.rootPath, src.relPath, loc.rootPath, loc.relPath);
     return { ok: true, path: target, rootPath: loc.rootPath, relPath: loc.relPath };
   } catch (err) { return { ok: false, error: err.message }; }
 });
@@ -1060,6 +1172,7 @@ ipcMain.handle('delete-path', async (e, absPath) => {
     });
     if (response !== 0) return { ok: false, canceled: true };
     await shell.trashItem(absPath);
+    if (isDir) { const loc = locateInRoots(absPath); if (loc.rootPath) removeKeptUnder(loc.rootPath, loc.relPath); }
     return { ok: true };
   } catch (err) { return { ok: false, error: err.message }; }
 });

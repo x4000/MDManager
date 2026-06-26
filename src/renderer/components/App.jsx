@@ -30,6 +30,7 @@ export default function App({ mode = 'main' }) {
   const [sidebarSide, setSidebarSide] = useState('left');
   const [sidebarWidth, setSidebarWidth] = useState(260);
   const [docScale, setDocScale] = useState(100);
+  const [showDocx, setShowDocx] = useState(false);
   const [roots, setRoots] = useState([]);
   const [expandedRoots, setExpandedRoots] = useState(() => new Set());
   const [expandedFolders, setExpandedFolders] = useState(() => new Set());
@@ -104,6 +105,7 @@ export default function App({ mode = 'main' }) {
       if (settings.sidebarSide === 'left' || settings.sidebarSide === 'right') setSidebarSide(settings.sidebarSide);
       if (Number.isFinite(settings.sidebarWidth)) setSidebarWidth(settings.sidebarWidth);
       if (Number.isFinite(settings.docScale)) setDocScale(settings.docScale);
+      if (typeof settings.showDocx === 'boolean') setShowDocx(settings.showDocx);
       if (Number.isFinite(settings.globalSearchHeight)) setGlobalSearchHeight(settings.globalSearchHeight);
       const loadedRoots = Array.isArray(settings.roots) ? settings.roots : [];
       setRoots(loadedRoots);
@@ -168,6 +170,22 @@ export default function App({ mode = 'main' }) {
     });
   }, [fetchTree]);
 
+  // Safety net for the file watcher: some folders (network/virtual drives) don't
+  // deliver reliable change events, so a newly-added folder could otherwise stay
+  // invisible until restart. Re-walk every expanded root whenever the window
+  // regains focus, so switching back to AMM always shows the current tree.
+  useEffect(() => {
+    const onFocus = () => {
+      for (const r of rootsRef.current) if (expandedRootsRef.current.has(r.path)) fetchTree(r.path);
+    };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [fetchTree]);
+
+  // Explicit tree refresh (e.g. right after creating a folder), independent of
+  // the watcher so the new item appears immediately.
+  const refreshTree = useCallback((rootPath) => { if (rootPath) fetchTree(rootPath); }, [fetchTree]);
+
   // ── Toggles ──────────────────────────────────────────────────────────
   const toggleTheme = useCallback(() => {
     setTheme((t) => {
@@ -187,6 +205,13 @@ export default function App({ mode = 'main' }) {
     setDocScale(val);
     window.arcenApi.saveSettings({ docScale: val });
     window.arcenApi.sendDocScale(val);
+  }, []);
+  const toggleDocx = useCallback(() => {
+    setShowDocx((v) => {
+      const next = !v;
+      window.arcenApi.saveSettings({ showDocx: next });
+      return next;
+    });
   }, []);
 
   // ── Read/Source mode + reference panel (per document) ────────────────
@@ -1081,6 +1106,9 @@ export default function App({ mode = 'main' }) {
             roots={roots}
             theme={theme}
             trees={trees}
+            showDocx={showDocx}
+            onToggleDocx={toggleDocx}
+            onTreeRefresh={refreshTree}
             expandedRoots={expandedRoots}
             expandedFolders={expandedFolders}
             activeKey={activeKey}
