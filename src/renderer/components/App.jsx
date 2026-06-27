@@ -65,6 +65,7 @@ export default function App({ mode = 'main' }) {
   const treesRef = useRef(trees);
   const rootsRef = useRef(roots);
   const tabsRef = useRef(tabs);
+  const revealInSidebarRef = useRef(null); // latest revealInSidebar, for callers defined before it
   const activeKeyRef = useRef(null);
   const activeTabIndexRef = useRef(-1);
   const mruRef = useRef([]); // doc keys in most-recently-active order (oldest→newest)
@@ -86,12 +87,22 @@ export default function App({ mode = 'main' }) {
   const scrollSaveTimer = useRef(null);
 
   const fetchTree = useCallback(async (rootPath) => {
-    setTrees((prev) => ({ ...prev, [rootPath]: { ...(prev[rootPath] || {}), loading: true } }));
+    // Only show the "Loading…" state on the FIRST load. For background refreshes
+    // (window focus, file watcher) keep the current tree on screen so the list
+    // doesn't momentarily collapse to a single row — that collapse shrinks the
+    // scroll height and the browser clamps the sidebar scroll back to the top.
+    setTrees((prev) => {
+      const cur = prev[rootPath];
+      if (cur && cur.tree) return prev; // keep the existing tree visible while refetching
+      return { ...prev, [rootPath]: { ...(cur || {}), loading: true } };
+    });
     const res = await window.arcenApi.listTree(rootPath);
-    setTrees((prev) => ({
-      ...prev,
-      [rootPath]: res && res.ok ? { tree: res.tree } : { error: (res && res.error) || 'error' },
-    }));
+    setTrees((prev) => {
+      if (res && res.ok) return { ...prev, [rootPath]: { tree: res.tree } };
+      const cur = prev[rootPath];
+      if (cur && cur.tree) return prev; // refresh failed but we still have a good tree — keep it
+      return { ...prev, [rootPath]: { error: (res && res.error) || 'error' } };
+    });
   }, []);
 
   // ── Initial load ───────────────────────────────────────────────────
@@ -378,6 +389,9 @@ export default function App({ mode = 'main' }) {
   const activateTab = useCallback((index) => {
     setActiveTabIndex(index);
     window.arcenApi.saveSession({ activeTab: index });
+    // Focus the sidebar on the activated document (open its folders, scroll to it).
+    const t = tabsRef.current[index];
+    if (t && revealInSidebarRef.current) revealInSidebarRef.current(t.rootPath, t.relPath);
   }, []);
 
   // Ctrl+Tab / Ctrl+Shift+Tab: step to the next/previous tab by position (wraps).
@@ -666,6 +680,18 @@ export default function App({ mode = 'main' }) {
     }
     setRevealTarget({ rootPath, relPath, seq: Date.now() });
   }, [fetchTree]);
+  revealInSidebarRef.current = revealInSidebar;
+
+  // Re-focus the sidebar on whatever document is currently active (open its
+  // folders + scroll it into view). Used when activating a tab or clicking into
+  // the document body — it only moves the sidebar if the doc isn't already
+  // centred, so it's a no-op when nothing needs to change.
+  const revealActiveDoc = useCallback(() => {
+    const t = activeDocRef.current;
+    if (t && t.rootPath && t.relPath && revealInSidebarRef.current) {
+      revealInSidebarRef.current(t.rootPath, t.relPath);
+    }
+  }, []);
 
   // Used by the sidebar name-search so it can filter across roots not yet opened.
   const ensureAllTrees = useCallback(() => {
@@ -1130,7 +1156,7 @@ export default function App({ mode = 'main' }) {
           />
         </div>
         <div className="sidebar-resize-handle" onMouseDown={handleSidebarDragStart} />
-        <div className="main-area">
+        <div className="main-area" onMouseDownCapture={revealActiveDoc}>
           <TabBar tabs={tabs} activeIndex={activeTabIndex} dirtyKeys={dirtyKeys} onActivate={activateTab} onClose={closeTab} onContextMenu={handleTabContextMenu} onReorder={reorderTabs} onDetach={detachTab} />
           {activeDoc ? (
             <DocumentArea
