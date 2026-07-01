@@ -274,10 +274,18 @@ async function walkMdAsync(absRoot) {
 }
 
 // ── File-tree watcher ────────────────────────────────────────────────
-// One recursive watcher across every configured root. On any .md or folder
+// Recursively watches every configured root. On any .md/.docx or folder
 // add/remove it debounces a `tree-changed` broadcast (carrying the affected
 // root path when known) so renderers can refetch just that root's tree.
-let watcher = null;
+//
+// Two backends (see setupWatcher): a native recursive `fs.watch` per root on
+// Windows/macOS — one OS handle covering the whole subtree, and the OS hands us
+// the changed filename so we can filter by extension in O(1) — and chokidar on
+// Linux (where recursive `fs.watch` isn't dependable). The native path is what
+// keeps an unrelated high-rate writer under a watched root (e.g. a batch job
+// dumping hundreds of thousands of .txt files) from pegging a core: chokidar
+// re-reads a directory on every raw event, native watching does not.
+let watchers = []; // active fs.FSWatcher (native) and/or chokidar instances
 let treeChangeTimer = null;
 const pendingTreeRoots = new Set();
 
@@ -299,8 +307,13 @@ function flushTreeChanges() {
   for (const r of roots) broadcastAll('tree-changed', r);
 }
 
+function closeWatchers() {
+  for (const w of watchers) { try { w.close(); } catch (_) { /* ignore */ } }
+  watchers = [];
+}
+
 function setupWatcher() {
-  try { if (watcher) { watcher.close(); watcher = null; } } catch (_) { /* ignore */ }
+  closeWatchers();
   const paths = existingRootPaths();
   if (!paths.length) return;
   // Normalize to lowercase forward-slashes with no trailing separator so the
@@ -334,37 +347,111 @@ function setupWatcher() {
     const ref = toDocRef(changedPath);
     if (ref) notifyReload(ref.rootPath, ref.relPath);
   };
-  watcher = chokidar.watch(paths, {
-    ignored: (p) => {
-      const base = path.basename(p);
-      if (base.startsWith('.')) return true;
-      return isIgnoredDirName(base);
-    },
-    ignoreInitial: true,
-    persistent: true,
-    awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
-  });
-  // 'change' = in-place edit. 'add' = file (re)created — many editors save
-  // atomically (write a temp file then rename over the original), which surfaces
-  // as add rather than change, so an open doc must reload on both. noteChange
-  // additionally refreshes the sidebar tree on add/unlink.
-  watcher.on('change', reloadOpenDoc);
-  watcher.on('add', (p) => {
-    const lp = p.toLowerCase();
-    if (lp.endsWith('.md')) { noteChange(p); reloadOpenDoc(p); }
-    else if (lp.endsWith('.docx')) noteChange(p);
-  });
-  watcher.on('unlink', (p) => {
-    const lp = p.toLowerCase();
-    if (lp.endsWith('.md') || lp.endsWith('.docx')) noteChange(p);
-  });
-  watcher.on('addDir', noteChange);
-  watcher.on('unlinkDir', noteChange);
-  // A broad root (e.g. a whole repo dir) can surface EPERM/ENOENT on odd files
-  // mid-scan. Swallow them here so they don't bubble up as unhandled rejections.
-  watcher.on('error', (err) => {
-    try { console.warn('[watcher]', err && err.message ? err.message : err); } catch (_) { /* ignore */ }
-  });
+  // A broad root (a whole repo dir) can surface EPERM/ENOENT on odd files, and a
+  // native recursive watch can overflow under very heavy churn. Swallow both so
+  // they don't bubble up as unhandled errors — our tree refresh is coarse and
+  // debounced, so an occasional dropped event is harmless.
+  const swallow = (err) => { try { console.warn('[watcher]', err && err.message ? err.message : err); } catch (_) { /* ignore */ } };
+
+  // ── chokidar backend (Linux, plus any root where native recursive watch is
+  // unavailable). Watches only .md/.docx files — see the ignore note.
+  const makeChokidar = (roots) => {
+    const w = chokidar.watch(roots, {
+      ignored: (p, stats) => {
+        const base = path.basename(p);
+        if (base.startsWith('.')) return true;
+        if (isIgnoredDirName(base)) return true;
+        // Only track the docs we render (.md/.docx); ignoring every other *file*
+        // keeps the watcher cheap when a root holds an unrelated churn of files
+        // (a batch job writing hundreds of thousands of .txt outputs). Directories
+        // are never ignored — docs live at arbitrary depth, so the walk must
+        // descend everywhere. `stats` can be absent on the initial readdir pass
+        // (return false → keep walking); chokidar re-tests with stats before it
+        // actually watches, dropping non-doc files then.
+        if (stats && stats.isFile() && !isTreeFile(base)) return true;
+        return false;
+      },
+      ignoreInitial: true,
+      persistent: true,
+      awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
+    });
+    // 'change' = in-place edit. 'add' = file (re)created — many editors save
+    // atomically (temp file + rename), which surfaces as add not change, so an
+    // open doc must reload on both. noteChange refreshes the tree on add/unlink.
+    w.on('change', reloadOpenDoc);
+    w.on('add', (p) => {
+      const lp = p.toLowerCase();
+      if (lp.endsWith('.md')) { noteChange(p); reloadOpenDoc(p); }
+      else if (lp.endsWith('.docx')) noteChange(p);
+    });
+    w.on('unlink', (p) => {
+      const lp = p.toLowerCase();
+      if (lp.endsWith('.md') || lp.endsWith('.docx')) noteChange(p);
+    });
+    w.on('addDir', noteChange);
+    w.on('unlinkDir', noteChange);
+    w.on('error', swallow);
+    return w;
+  };
+
+  // ── Native recursive backend (Windows/macOS). `fs.watch` hands us the changed
+  // filename directly, so a non-doc file (the churn) is dropped on a plain
+  // string check — no directory re-read, no per-file stat, no polling.
+  const ignoredSegment = (filename) => {
+    for (const s of filename.split(/[\\/]+/)) {
+      if (!s) continue;
+      if (s.startsWith('.')) return true;      // dotfile/dotdir anywhere in the path
+      if (isIgnoredDirName(s)) return true;    // node_modules/.git/dist/bin/obj/*.app
+    }
+    return false;
+  };
+  // fs.watch gives only 'rename'/'change' + a filename — no add/unlink flag and
+  // no file-vs-dir flag — so we reconstruct intent from the event type and the
+  // extension. Crucially, structural tree changes (a doc or folder appearing or
+  // disappearing) come through as 'rename'; a directory whose *contents* changed
+  // fires 'change' on the directory itself, and we must ignore that — otherwise a
+  // high-rate writer under a watched root would fire a 'change' on its output
+  // folder for every file and drag the sidebar into endless refetches.
+  const onNativeEvent = (root, event, filename) => {
+    if (!filename) { noteChange(root); return; }   // no name → coarse root refresh
+    if (ignoredSegment(filename)) return;
+    const absPath = path.join(root, filename);
+    const ext = path.extname(filename).toLowerCase();
+    if (ext === '.md') {
+      let exists = false;
+      try { exists = fs.existsSync(absPath); } catch (_) { /* treat as gone */ }
+      if (event === 'rename') noteChange(absPath); // doc added or removed → tree may change
+      if (exists) reloadOpenDoc(absPath);          // present after add/edit → reload if open
+    } else if (ext === '.docx') {
+      if (event === 'rename') noteChange(absPath);
+    } else if (ext === '' && event === 'rename') {
+      // A folder create/rename/delete refreshes the sidebar; a plain extensionless
+      // *file* (LICENSE, etc.) shouldn't, but that's rare and harmless. One stat
+      // tells them apart; the file flood is all extensioned and never reaches it.
+      let isDir = false; let existed = true;
+      try { isDir = fs.statSync(absPath).isDirectory(); } catch (_) { existed = false; }
+      if (isDir || !existed) noteChange(absPath);
+    }
+    // else: any other file extension (the churn) or a bare 'change' → ignored
+  };
+
+  if (process.platform === 'win32' || process.platform === 'darwin') {
+    const fallback = [];
+    for (const root of paths) {
+      let w;
+      try {
+        w = fs.watch(root, { recursive: true, persistent: true }, (event, filename) => onNativeEvent(root, event, filename));
+      } catch (_) {
+        fallback.push(root);                       // native recursive unavailable here → chokidar
+        continue;
+      }
+      w.on('error', swallow);
+      watchers.push(w);
+    }
+    if (fallback.length) watchers.push(makeChokidar(fallback));
+  } else {
+    watchers.push(makeChokidar(paths));            // Linux: unchanged chokidar behavior
+  }
 }
 
 // ── Window ───────────────────────────────────────────────────────────
