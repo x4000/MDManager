@@ -10,6 +10,9 @@ const fs = require('fs');
 const path = require('path');
 const chokidar = require('chokidar');
 const { convertMarkdownToDocx } = require('./mdToDocx');
+// Async equivalent of fs.realpathSync.native — the fast OS realpath, used to
+// canonicalize dirs for junction/symlink cycle detection during the tree walk.
+const realpathNative = require('util').promisify(fs.realpath.native);
 
 // ── Central settings location ────────────────────────────────────────
 // Mirrors AXE's `%APPDATA%/ArcenSettings/<App>/` convention so all Arcen
@@ -146,19 +149,24 @@ function isTreeFile(name) {
   return n.endsWith('.md') || n.endsWith('.docx');
 }
 
-function buildTree(absRoot, keptSet) {
+// Async so it never blocks the main thread: a root can span a huge tree (e.g. a
+// repo root holding an unrelated job's output — hundreds of thousands of files),
+// and a synchronous walk there froze the whole app (window, IPC) for ~half a
+// second on every refresh. `await`ing each readdir yields to the event loop
+// between directories, spreading the walk out so the UI stays responsive.
+async function buildTree(absRoot, keptSet) {
   const kept = keptSet || new Set();
   const collator = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
   // Canonical paths already descended into, so an NTFS junction / symlink that
   // points back at an ancestor can't drive unbounded recursion.
   const visited = new Set();
-  function walk(absDir, relPrefix) {
+  async function walk(absDir, relPrefix) {
     let real;
-    try { real = fs.realpathSync.native(absDir).toLowerCase(); } catch (_) { real = absDir.toLowerCase(); }
+    try { real = (await realpathNative(absDir)).toLowerCase(); } catch (_) { real = absDir.toLowerCase(); }
     if (visited.has(real)) return { dirs: [], files: [] };
     visited.add(real);
     let entries;
-    try { entries = fs.readdirSync(absDir, { withFileTypes: true }); }
+    try { entries = await fs.promises.readdir(absDir, { withFileTypes: true }); }
     catch (_) { return { dirs: [], files: [] }; }
     const dirs = [];
     const files = [];
@@ -167,7 +175,7 @@ function buildTree(absRoot, keptSet) {
       const rel = relPrefix ? `${relPrefix}/${e.name}` : e.name;
       if (e.isDirectory()) {
         if (isIgnoredDirName(e.name)) continue;
-        const child = walk(path.join(absDir, e.name), rel);
+        const child = await walk(path.join(absDir, e.name), rel);
         // Keep a folder if it holds documents/subfolders, OR if it was created
         // through the app (kept) so a freshly-made empty folder still shows.
         if (child.dirs.length || child.files.length || kept.has(rel.toLowerCase())) {
@@ -252,7 +260,7 @@ async function walkMdAsync(absRoot) {
   const visited = new Set(); // canonical dirs, to break junction/symlink cycles
   async function walk(absDir, rel) {
     let real;
-    try { real = (await fs.promises.realpath(absDir)).toLowerCase(); } catch (_) { real = absDir.toLowerCase(); }
+    try { real = (await realpathNative(absDir)).toLowerCase(); } catch (_) { real = absDir.toLowerCase(); }
     if (visited.has(real)) return;
     visited.add(real);
     let entries;
@@ -307,6 +315,30 @@ function flushTreeChanges() {
   for (const r of roots) broadcastAll('tree-changed', r);
 }
 
+// Does this directory hold a .md/.docx anywhere within? Used to decide whether a
+// newly-appeared folder is worth a sidebar refresh — an empty output/scratch
+// folder (a job creating thousands of them) never shows in the tree, so it
+// shouldn't trigger a walk. Early-exits on the first doc; caps the dirs scanned
+// so a huge non-doc tree moved in can't turn this into an unbounded walk (hitting
+// the cap assumes relevant and refreshes, the safe default). Empty folders — the
+// common churn case — return instantly on their single empty readdir.
+function dirContainsDoc(absDir) {
+  const stack = [absDir];
+  let budget = 512;
+  while (stack.length) {
+    if (budget-- <= 0) return true;
+    const d = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch (_) { continue; }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      if (e.isDirectory()) { if (!isIgnoredDirName(e.name)) stack.push(path.join(d, e.name)); }
+      else if (e.isFile() && isTreeFile(e.name)) return true;
+    }
+  }
+  return false;
+}
+
 function closeWatchers() {
   for (const w of watchers) { try { w.close(); } catch (_) { /* ignore */ } }
   watchers = [];
@@ -326,7 +358,10 @@ function setupWatcher() {
     const idx = lowerRoots.findIndex((rp) => lp === rp || lp.startsWith(rp + '/'));
     pendingTreeRoots.add(idx >= 0 ? paths[idx] : null);
     if (treeChangeTimer) clearTimeout(treeChangeTimer);
-    treeChangeTimer = setTimeout(flushTreeChanges, 200);
+    // 400ms trailing debounce: under heavy folder churn (a job creating output
+    // dirs, git writing objects) this collapses a storm of changes into one
+    // refresh per root instead of one every 200ms.
+    treeChangeTimer = setTimeout(flushTreeChanges, 400);
   };
   // Map a changed absolute path back to its (rootPath, relPath). relPath keeps
   // its on-disk casing (sliced from the original, not the lowercased path) so it
@@ -388,8 +423,10 @@ function setupWatcher() {
       const lp = p.toLowerCase();
       if (lp.endsWith('.md') || lp.endsWith('.docx')) noteChange(p);
     });
-    w.on('addDir', noteChange);
-    w.on('unlinkDir', noteChange);
+    // No addDir/unlinkDir handlers: a folder only matters to the sidebar once it
+    // gains or loses a doc, and chokidar scans new/removed dirs and fires the
+    // per-doc add/unlink above for that — so reacting to bare folder events would
+    // just burn a full tree walk on empty output/scratch folders that never show.
     w.on('error', swallow);
     return w;
   };
@@ -425,12 +462,14 @@ function setupWatcher() {
     } else if (ext === '.docx') {
       if (event === 'rename') noteChange(absPath);
     } else if (ext === '' && event === 'rename') {
-      // A folder create/rename/delete refreshes the sidebar; a plain extensionless
-      // *file* (LICENSE, etc.) shouldn't, but that's rare and harmless. One stat
-      // tells them apart; the file flood is all extensioned and never reaches it.
-      let isDir = false; let existed = true;
-      try { isDir = fs.statSync(absPath).isDirectory(); } catch (_) { existed = false; }
-      if (isDir || !existed) noteChange(absPath);
+      // A folder appeared or was renamed-in. It only matters to the sidebar if it
+      // actually contains a doc — an empty output/scratch folder (a job creating
+      // thousands of them) never shows in the tree, so skip it and spare the walk.
+      // Folder *removal* needs nothing here: deleting a folder surfaces the
+      // .md/.docx events for the docs inside (verified), which refresh on their own.
+      try {
+        if (fs.statSync(absPath).isDirectory() && dirContainsDoc(absPath)) noteChange(absPath);
+      } catch (_) { /* gone → a delete/rename-out; the doc events cover it */ }
     }
     // else: any other file extension (the churn) or a bare 'change' → ignored
   };
@@ -854,11 +893,23 @@ ipcMain.handle('set-root-nickname', (_e, rootPath, nickname) => {
 });
 
 // ── IPC: file tree ───────────────────────────────────────────────────
-ipcMain.handle('list-tree', (_e, rootPath) => {
+// One in-flight walk per root. Folder churn under a root (a job creating output
+// dirs, git writing objects) fires many tree-changed events in quick succession,
+// and every window refetches on each — without this guard those would stack N
+// simultaneous walks of the same big tree on the main thread. Concurrent callers
+// share the one running walk; the next change after it settles starts a fresh one.
+const treeWalkInFlight = new Map(); // rootPath -> Promise<tree>
+ipcMain.handle('list-tree', async (_e, rootPath) => {
   try {
     if (!rootPath || !fs.existsSync(rootPath)) return { ok: false, error: 'not-found' };
-    pruneKeptFolders(rootPath);
-    return { ok: true, tree: buildTree(rootPath, keptSetForRoot(rootPath)) };
+    let inflight = treeWalkInFlight.get(rootPath);
+    if (!inflight) {
+      pruneKeptFolders(rootPath);
+      inflight = buildTree(rootPath, keptSetForRoot(rootPath))
+        .finally(() => treeWalkInFlight.delete(rootPath));
+      treeWalkInFlight.set(rootPath, inflight);
+    }
+    return { ok: true, tree: await inflight };
   } catch (err) {
     return { ok: false, error: err.message };
   }
